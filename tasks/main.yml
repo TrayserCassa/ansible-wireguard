@@ -19,6 +19,7 @@
     - "setup-{{ ansible_os_family|lower }}.yml"
   tags:
     - wg-install
+  when: ansible_facts['ansible_' + wireguard_interface] is not defined
 
 - name: Enable WireGuard kernel module
   community.general.modprobe:
@@ -33,88 +34,26 @@
     - wg-install
   when: not ansible_os_family == 'Darwin'
 
-- name: Generate keys | Check wg syncconf subcommand status
-  block:
-    - name: Register if config/private key already exists on target host
-      ansible.builtin.stat:
-        path: "{{ wireguard_remote_directory }}/{{ wireguard_interface }}.conf"
-      register: wireguard__register_config_file
+# - name: Derive WireGuard public key
+#   delegate_to: localhost
+#   ansible.builtin.command: "wg pubkey"
+#   args:
+#     stdin: "{{ wireguard_private_key }}"
+#   register: wireguard__register_public_key
+#   changed_when: false
+#   check_mode: false
+#   tags:
+#     - wg-config
 
-    - name: Get wg subcommands
-      ansible.builtin.command: "wg --help"
-      register: wireguard__register_subcommands
-      changed_when: false
-      check_mode: false
-
-    - name: Check if wg syncconf subcommand is available
-      ansible.builtin.set_fact:
-        wg_syncconf: "{{ 'syncconf:' in wireguard__register_subcommands.stdout }}"
-
-    - name: Show syncconf subcommand status
-      ansible.builtin.debug:
-        var: wg_syncconf
-  tags:
-    - wg-generate-keys
-    - wg-config
-
-- name: WireGuard private key handling for new keys
-  block:
-    - name: Generate WireGuard private key
-      ansible.builtin.command: "wg genkey"
-      register: wireguard__register_private_key
-      changed_when: false
-      no_log: '{{ ansible_verbosity < 3 }}'
-      tags:
-        - wg-generate-keys
-
-    - name: Set private key fact
-      ansible.builtin.set_fact:
-        wireguard_private_key: "{{ wireguard__register_private_key.stdout }}"
-      no_log: '{{ ansible_verbosity < 3 }}'
-      tags:
-        - wg-generate-keys
-  when:
-    - not wireguard__register_config_file.stat.exists
-    - wireguard_private_key is not defined
-
-- name: WireGuard private key handling for existing keys
-  block:
-    - name: Read WireGuard config file
-      ansible.builtin.slurp:
-        src: "{{ wireguard_remote_directory }}/{{ wireguard_interface }}.conf"
-      register: wireguard__register_config
-      no_log: '{{ ansible_verbosity < 3 }}'
-      tags:
-        - wg-config
-
-    - name: Set private key fact
-      ansible.builtin.set_fact:
-        wireguard_private_key: "{{ wireguard__register_config['content'] | b64decode | regex_findall('PrivateKey = (.*)') | first }}"
-      no_log: '{{ ansible_verbosity < 3 }}'
-      tags:
-        - wg-config
-  when:
-    - wireguard__register_config_file.stat.exists
-    - wireguard_private_key is not defined
-
-- name: Derive WireGuard public key
-  ansible.builtin.command: "wg pubkey"
-  args:
-    stdin: "{{ wireguard_private_key }}"
-  register: wireguard__register_public_key
-  changed_when: false
-  check_mode: false
-  no_log: '{{ ansible_verbosity < 3 }}'
-  tags:
-    - wg-config
-
-- name: Set public key fact
-  ansible.builtin.set_fact:
-    wireguard__fact_public_key: "{{ wireguard__register_public_key.stdout }}"
-  tags:
-    - wg-config
+# - name: Set public key fact
+#   delegate_to: localhost
+#   ansible.builtin.set_fact:
+#     wireguard__public_key: "{{ wireguard__register_public_key.stdout }}"
+#   tags:
+#     - wg-config
 
 - name: Create WireGuard configuration directory
+  become: true
   ansible.builtin.file:
     dest: "{{ wireguard_remote_directory }}"
     state: directory
@@ -122,14 +61,29 @@
   tags:
     - wg-config
 
-- name: Generate WireGuard configuration file
+- name: Generate Server WireGuard configuration file
   ansible.builtin.template:
-    src: etc/wireguard/wg.conf.j2
+    src: etc/wireguard/wg_server.conf.j2
     dest: "{{ wireguard_remote_directory }}/{{ wireguard_interface }}.conf"
     owner: "{{ wireguard_conf_owner }}"
     group: "{{ wireguard_conf_group }}"
     mode: "{{ wireguard_conf_mode }}"
-  no_log: '{{ ansible_verbosity < 3 }}'
+  become: true
+  when: wireguard_server | default(false)
+  tags:
+    - wg-config
+  notify:
+    - reconfigure wireguard
+
+- name: Generate Client Wireguard configuration file
+  ansible.builtin.template:
+    src: etc/wireguard/wg_client.conf.j2
+    dest: "{{ wireguard_remote_directory }}/{{ wireguard_interface }}.conf"
+    owner: "{{ wireguard_conf_owner }}"
+    group: "{{ wireguard_conf_group }}"
+    mode: "{{ wireguard_conf_mode }}"
+  become: true
+  when: not wireguard_server | default(false)
   tags:
     - wg-config
   notify:
@@ -143,6 +97,7 @@
     - wg-config
 
 - name: Start and enable WireGuard service
+  become: true
   ansible.builtin.service:
     name: "wg-quick@{{ wireguard_interface }}"
     state: "{{ wireguard_service_state }}"
